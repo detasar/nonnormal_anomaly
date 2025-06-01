@@ -8,20 +8,16 @@ name = "hypernova_anomaly_core"
 crate-type = ["cdylib"]
 
 [dependencies]
-# Python-Rust entegrasyonu - TÜM İLGİLİ VERSİYONLAR KİLİTLENDİ
-# Bu versiyonların birbiriyle uyumlu olduğu test edilmiştir.
+# Python-Rust entegrasyonu
 pyo3 = { version = "0.21.2", features = ["extension-module"] }
-pyo3-arrow = "0.12.0" # v0.12.0, pyo3 v0.21 ile uyumludur
 
-# Yüksek performanslı veri işleme
-# arrow'un pyarrow özelliği de pyo3 v0.21'e bağımlıdır.
-arrow = { version = "52.0.0", features = ["pyarrow"] } 
+# Arrow köprüsü yerine NumPy köprüsünü kullanıyoruz.
+# Bu, çok daha stabil bir bağımlılıktır.
+pyo3-numpy = "0.21.0"
+
+# Hesaplama kütüphaneleri
 ndarray = { version = "0.15.6", features = ["rayon"] }
 ndarray-stats = "0.5.1"
 num-traits = "0.2.18"
-
-# Paralel iterasyonlar için
 rayon = "1.10.0"
-
-# Hata yönetimi
 thiserror = "1.0.61"
