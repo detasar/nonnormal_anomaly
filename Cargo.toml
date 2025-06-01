@@ -1,24 +1,26 @@
 [package]
-name = "nonnormal_anomaly_core"
-version = "0.1.0"
+name = "hypernova_anomaly_core"
+version = "1.0.0"
 edition = "2021"
 
 [lib]
-name = "nonnormal_anomaly_core"
+name = "hypernova_anomaly_core"
 crate-type = ["cdylib"]
 
 [dependencies]
-# Python-Rust baglantilari icin
+# Python-Rust entegrasyonu
 pyo3 = { version = "0.21.2", features = ["extension-module"] }
 pyo3-arrow = { version = "0.9.0" }
 
-# Veri isleme ve hesaplama icin
+# Yüksek performanslı veri işleme
+# HATA BURADAYDI: 'arrow-rs' yerine 'arrow' olmalı.
 arrow = { version = "52.0.0", features = ["pyarrow"] }
 ndarray = { version = "0.15.6", features = ["rayon"] }
 ndarray-stats = "0.5.1"
 num-traits = "0.2.18"
 
-# Paralellestirme icin
+# Paralel iterasyonlar için
 rayon = "1.10.0"
+
 # Hata yönetimi
 thiserror = "1.0.61"
