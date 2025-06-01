@@ -1,106 +1,120 @@
-use arrow_rs::array::{ArrayRef, BooleanArray, Float64Array, PrimitiveArray};
-use arrow_rs::datatypes::Float64Type;
-use arrow_rs::record_batch::RecordBatch;
 use ndarray::prelude::*;
 use ndarray_stats::{QuantileExt,interpolate::Linear};
 use num_traits::Zero;
 use pyo3::prelude::*;
-use pyo3::wrap_pyfunction;
-use pyo3_arrow::PyArrowType;
-use rayon::prelude::*;
+use pyo3_numpy::{PyReadonlyArray1, PyArray1};
+use thiserror::Error;
 
-/// Medyan Mutlak Sapma (MAD) ve Modifiye Z-skoru kullanarak anomali tespiti yapar.
-///
-/// Bu fonksiyon, raporun Bölüm I-B'sinde önerilen dayanıklı istatistiksel yöntemi uygular.
-/// Paralel hesaplama için Rayon'dan yararlanır (Bölüm II-B).
-///
-/// # Arguments
-/// * `data` - Girdi verilerini içeren bir ndarray dizisi.
-/// * `threshold` - Anomali olarak kabul edilecek Modifiye Z-skoru eşiği (genellikle 3.5).
-///
-/// # Returns
-/// * `(scores, flags)` - Modifiye Z-skorlarını ve anomali bayraklarını içeren bir tuple.
-fn detect_anomalies_mad_core(
-    data: ArrayView1<f64>,
-    threshold: f64,
-) -> PyResult<(Vec<f64>, Vec<bool>)> {
-    // 1. Verinin medyanını hesapla
-    let data_median = data.quantile_mut(0.5, &Linear).unwrap();
+// Özel hata türleri
+#[derive(Error, Debug)]
+pub enum SpotError {
+    #[error("İlk kalibrasyon verisi (n_init) yetersiz: {0} noktadan az olamaz.")]
+    InsufficientInitialData(usize),
+    #[error("Başlangıç eşiği (level) için %99.9'dan yüksek bir değer seçilemez.")]
+    LevelTooHigh,
+    #[error("Hesaplama sırasında varyans sıfır çıktı, GPD uydurulamıyor.")]
+    ZeroVarianceError,
+}
 
-    // 2. Medyandan mutlak sapmaları hesapla (paralel olarak)
-    let abs_deviations: Vec<f64> = data
-        .into_par_iter()
-        .map(|x| (x - data_median).abs())
-        .collect();
-    let mut abs_deviations_arr = Array1::from(abs_deviations);
+// SPOT algoritmasının durumunu tutan ana yapı (Değişiklik yok)
+struct Spot {
+    q: f64,
+    t: f64,
+    num_total: usize,
+    num_peaks: usize,
+    peaks: Vec<f64>,
+    gamma: f64,
+    sigma: f64,
+}
 
-    // 3. Mutlak sapmaların medyanını (MAD) hesapla
-    let mad = abs_deviations_arr.quantile_mut(0.5, &Linear).unwrap();
+impl Spot {
+    fn new(q: f64, initial_data: ArrayView1<f64>, level: f64) -> Result<Self, SpotError> {
+        let n_init = initial_data.len();
+        if n_init < 30 { return Err(SpotError::InsufficientInitialData(30)); }
+        if level > 0.999 { return Err(SpotError::LevelTooHigh); }
 
-    // 4. Modifiye Z-skorlarını hesapla
-    let scores: Vec<f64> = data
-        .into_par_iter()
-        .map(|x| {
-            // Raporun belirttiği kritik durum: MAD'nin sıfır olması
-            if mad.is_zero() {
-                if *x == data_median { 0.0 } else { f64::INFINITY }
-            } else {
-                // Raporun önerdiği ölçekleme faktörü: 0.6745
-                0.6745 * (x - data_median) / mad
+        let mut initial_data_mut = initial_data.to_owned();
+        let t = *initial_data_mut.quantile_mut(level, &Linear).unwrap();
+        let peaks: Vec<f64> = initial_data.iter().filter(|&&x| x > t).map(|&x| x - t).collect();
+        let num_peaks = peaks.len();
+        if num_peaks < 2 {
+            return Ok(Spot { q, t, num_total: n_init, num_peaks: 0, peaks: vec![], gamma: 0.1, sigma: 1.0 });
+        }
+        
+        let (gamma, sigma) = Self::fit_gpd_mom(&peaks)?;
+        Ok(Spot { q, t, num_total: n_init, num_peaks, peaks, gamma, sigma })
+    }
+
+    fn fit_gpd_mom(peaks: &[f64]) -> Result<(f64, f64), SpotError> {
+        let n = peaks.len() as f64;
+        let peak_mean = peaks.iter().sum::<f64>() / n;
+        let peak_var = peaks.iter().map(|&p| (p - peak_mean).powi(2)).sum::<f64>() / n;
+        if peak_var.abs() < 1e-9 { return Err(SpotError::ZeroVarianceError); }
+        let gamma = 0.5 * ((peak_mean.powi(2) / peak_var) - 1.0);
+        let sigma = peak_mean * (0.5 + 0.5 * (peak_mean.powi(2) / peak_var));
+        Ok((gamma, sigma))
+    }
+
+    fn calculate_zq(&self) -> f64 {
+        let nt = self.num_peaks as f64;
+        if nt == 0.0 { return f64::INFINITY; }
+        let n = self.num_total as f64;
+        if self.gamma.abs() < 1e-9 { return self.t - self.sigma * (self.q * n / nt).ln(); }
+        let term = (self.q * n / nt).powf(-self.gamma);
+        self.t + (self.sigma / self.gamma) * (term - 1.0)
+    }
+
+    fn process_point(&mut self, x: f64) -> bool {
+        self.num_total += 1;
+        let zq = self.calculate_zq();
+        if x > zq {
+            true
+        } else if x > self.t {
+            self.num_peaks += 1;
+            self.peaks.push(x - self.t);
+            if let Ok((gamma, sigma)) = Self::fit_gpd_mom(&self.peaks) {
+                self.gamma = gamma;
+                self.sigma = sigma;
             }
-        })
-        .collect();
-
-    // 5. Eşiğe göre anomali bayraklarını belirle
-    let flags: Vec<bool> = scores.par_iter().map(|s| s.abs() > threshold).collect();
-
-    Ok((scores, flags))
+            false
+        } else {
+            false
+        }
+    }
 }
 
-/// Python'dan çağrılacak ana fonksiyon. Apache Arrow verilerini işler.
-///
-/// Bu fonksiyon, Bölüm III-B'de belirtildiği gibi PyO3 ve pyo3-arrow kullanarak
-/// Python ve Rust arasında sıfır kopyalı veri aktarımı sağlar.
+/// Python'dan çağrılacak ana fonksiyon - ARTIK NUMPY DİZİSİ ALIYOR
 #[pyfunction]
-fn detect_anomalies_arrow(
-    py: Python,
-    batch: PyArrowType<RecordBatch>,
-    threshold: f64,
-) -> PyResult<PyArrowType<RecordBatch>> {
-    // 1. Arrow RecordBatch'inden veri sütununu al
-    // Sadece ilk sütun üzerinde işlem yapıldığı varsayılıyor.
-    let data_col: &PrimitiveArray<Float64Type> = batch
-        .as_ref()
-        .column(0)
-        .as_any()
-        .downcast_ref::<PrimitiveArray<Float64Type>>()
-        .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyTypeError, _>("Expected a Float64 column"))?;
+fn detect_evt_spot<'py>(
+    py: Python<'py>,
+    data_array: PyReadonlyArray1<'py, f64>,
+    q: f64,
+    n_init: usize,
+    level: f64,
+) -> PyResult<&'py PyArray1<bool>> {
+    let data = data_array.as_array(); // Sıfır kopya ile ndarray view'i al
 
-    // 2. Arrow verisini ndarray'e dönüştür
-    // Raporun IV-B bölümünde belirtildiği gibi, ndarray-stats'in değiştirilebilir
-    // dilim gereksinimi nedeniyle bu kopyalama gereklidir.
-    let data_view = data_col.values().view();
+    if data.len() <= n_init {
+        return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+            "Veri boyutu, başlangıç boyutu (n_init) kadar veya daha az olamaz."
+        ));
+    }
 
-    // 3. Çekirdek anomali tespit algoritmasını çağır
-    let (scores, flags) = detect_anomalies_mad_core(data_view, threshold)?;
+    let initial_data = data.slice(s![..n_init]);
+    let mut spot_model = Spot::new(q, initial_data, level)
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
 
-    // 4. Sonuçları Arrow dizilerine dönüştür
-    let scores_array: ArrayRef = std::sync::Arc::new(Float64Array::from(scores));
-    let flags_array: ArrayRef = std::sync::Arc::new(BooleanArray::from(flags));
+    let mut flags: Vec<bool> = vec![false; data.len()];
+    for i in n_init..data.len() {
+        flags[i] = spot_model.process_point(data[i]);
+    }
 
-    // 5. Sonuçları yeni bir RecordBatch olarak Python'a döndür
-    let result_batch = RecordBatch::try_from_iter(vec![
-        ("scores", scores_array),
-        ("is_anomaly", flags_array),
-    ])
-    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(e.to_string()))?;
-
-    Ok(PyArrowType(result_batch))
+    Ok(PyArray1::from_vec(py, flags))
 }
 
-
+// Python modülünü oluştur
 #[pymodule]
 fn core(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(detect_anomalies_arrow, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_evt_spot, m)?)?;
     Ok(())
 }
